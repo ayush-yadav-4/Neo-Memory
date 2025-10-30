@@ -1,0 +1,22 @@
+project_id = "jlqkwvpzuvarhfsjhzvk"
+
+[functions.generate-api-key]
+verify_jwt = false
+
+[functions.store-memory]
+verify_jwt = false
+
+[functions.retrieve-memories]
+verify_jwt = false
+
+[functions.list-memories]
+verify_jwt = false
+
+[functions.delete-memory]
+verify_jwt = false
+
+[functions.manage-api-keys]
+verify_jwt = false
+
+[functions.mcp-server]
+verify_jwt = false

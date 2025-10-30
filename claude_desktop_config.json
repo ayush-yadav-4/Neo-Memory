@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "memory-api": {
+      "url": "http://localhost:8787/mcp-server",
+      "headers": {
+        "X-API-Key": "YOUR_API_KEY_HERE"
+      }
+    }
+  }
+}
