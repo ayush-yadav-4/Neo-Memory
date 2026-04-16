@@ -106,7 +106,7 @@ const ApiKeySection = ({ onApiKeyGenerated }: ApiKeySectionProps) => {
         <Button 
           onClick={handleGenerateKey} 
           disabled={isLoading || !keyName.trim()}
-          className="w-full bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700 text-white"
+          className="w-full bg-blue-600 hover:bg-blue-700 text-white"
         >
           {isLoading ? (
             <>

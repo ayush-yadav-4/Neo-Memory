@@ -1,4 +1,6 @@
-# Welcome to your Lovable project
+# Neo Memory
+
+A next-generation memory management system powered by AI embeddings. Store, search, and manage memories using semantic similarity.
 
 ## Project info
 

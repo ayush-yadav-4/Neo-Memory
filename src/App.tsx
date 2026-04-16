@@ -11,6 +11,9 @@ import ConnectMCP from "./pages/ConnectMCP";
 import NotFound from "./pages/NotFound";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
+import Chat from "./pages/Chat";
+import ChatMemory from "./pages/ChatMemory";
+import TalkWithFile from "./pages/TalkWithFile";
 
 
 const queryClient = new QueryClient();
@@ -24,6 +27,9 @@ const App = () => (
         <Routes>
           <Route path="/" element={<Index />} />
           <Route path="/dashboard" element={<Dashboard />} />
+          <Route path="/chat" element={<Chat />} />
+          <Route path="/chat-memory" element={<ChatMemory />} />
+          <Route path="/talk-with-file" element={<TalkWithFile />} />
           <Route path="/about" element={<AboutUs />} />
           <Route path="/docs" element={<Documentation />} />
           <Route path="/connect" element={<ConnectMCP />} />

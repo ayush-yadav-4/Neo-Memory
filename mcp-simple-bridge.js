@@ -8,8 +8,8 @@ import http from 'http';
 
 // Configuration
 const API_URL = 'http://localhost:8787/mcp-server';
-const API_KEY = process.env.API_KEY; // No fallback in repo
-const COHERE_API_KEY = process.env.COHERE_API_KEY; // No fallback in repo
+const API_KEY = process.env.API_KEY || 'sk_mem_b906ee732a0d7de8116a06ac18b1d641f2f7ef733ad426805693c3cd871f0048';
+const COHERE_API_KEY = process.env.COHERE_API_KEY || 'Z6OW9Khqf4GsBCrWxHCJZWO3ww5lSPy11oWPGw8U';
 
 console.error('🔗 MCP Bridge connecting to existing server...');
 console.error('📡 Target: http://localhost:8787/mcp-server');
@@ -27,7 +27,7 @@ function makeHttpRequest(data) {
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(postData),
-        ...(API_KEY ? { 'X-API-Key': API_KEY } : {})
+        'X-API-Key': API_KEY
       }
     };
 

@@ -1,16 +1,16 @@
 import React, { createContext, useContext } from 'react';
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Brain, Key, Database, Search, Settings, Copy, Check, LogOut, User, BookOpen, Code } from 'lucide-react';
+import { Key, Database, Search, Settings, Copy, Check, LogOut, User, BookOpen, Code, MessageSquare, FileText } from 'lucide-react';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
+import { Label } from '@/components/ui/label';
 import { useToast } from '@/hooks/use-toast';
 import ApiKeySection from '@/components/memory/ApiKeySection';
 import StoreMemorySection from '@/components/memory/StoreMemorySection';
-import RetrieveMemorySection from '@/components/memory/RetrieveMemorySection';
 import MemoryListSection from '@/components/memory/MemoryListSection';
 
 interface ApiKeyListItem {
@@ -40,7 +40,7 @@ export const useApiKeyContext = () => {
 
 const Dashboard = () => {
   const navigate = useNavigate();
-  const [activeApiKey, setActiveApiKey] = useState<string>(import.meta.env.VITE_DEFAULT_API_KEY || '');
+  const [activeApiKey, setActiveApiKey] = useState<string>('sk_mem_d478a10c1749e2c7c223028c9b48738f086b369d4a05c52bbe393b156281ded4');
   const [apiKeys, setApiKeys] = useState<ApiKeyListItem[]>([]);
   const [refreshMemories, setRefreshMemories] = useState<number>(0);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
@@ -83,34 +83,58 @@ const Dashboard = () => {
     loadApiKeys();
   }, []);
 
-  const handleLogout = () => {
-    // Clear any stored data
-    localStorage.removeItem('activeApiKey');
-    // Navigate to home page
-    navigate('/');
-    toast({
-      title: 'Logged out',
-      description: 'You have been successfully logged out',
-    });
+  const handleLogout = async () => {
+    try {
+      const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8787';
+      await fetch(`${apiBase}/auth/logout`, {
+        method: 'POST',
+        credentials: 'include',
+      });
+    } catch (error) {
+      console.error('Logout error:', error);
+    } finally {
+      // Clear any stored data
+      localStorage.removeItem('activeApiKey');
+      // Navigate to home page
+      navigate('/');
+      toast({
+        title: 'Logged out',
+        description: 'You have been successfully logged out',
+      });
+    }
   };
 
   return (
     <ApiKeyContext.Provider value={{ activeApiKey, setActiveApiKey, apiKeys, setApiKeys }}>
       <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950">
-        {/* Navbar */}
+        
         <nav className="border-b border-slate-800 bg-slate-900/50 backdrop-blur-sm">
           <div className="container mx-auto px-6 py-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-3">
-                <div className="p-2 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 shadow-lg">
-                  <Brain className="w-8 h-8 text-white" />
-                </div>
-                <h1 className="text-2xl font-bold bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">
-                  NeoMemory
+                <img src="/Neomemory-logo.png" alt="Neo Memory Logo" className="w-12 h-12" />
+                <h1 className="text-2xl font-bold text-white">
+                  Neo Memory
                 </h1>
               </div>
               
               <div className="flex items-center gap-4">
+                <Button 
+                  variant="ghost" 
+                  onClick={() => navigate('/chat')}
+                  className="text-slate-300 hover:text-white hover:bg-slate-800"
+                >
+                  <MessageSquare className="w-4 h-4 mr-2" />
+                  Chat
+                </Button>
+                <Button 
+                  variant="ghost" 
+                  onClick={() => navigate('/talk-with-file')}
+                  className="text-slate-300 hover:text-white hover:bg-slate-800"
+                >
+                  <FileText className="w-4 h-4 mr-2" />
+                  Talk with File
+                </Button>
                 <Button 
                   variant="ghost" 
                   onClick={() => navigate('/about')}
@@ -151,12 +175,10 @@ const Dashboard = () => {
         <main className="container mx-auto px-6 py-8">
           <div className="mb-8">
             <div className="flex items-center gap-3 mb-2">
-              <div className="p-2 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 shadow-lg">
-                <Brain className="w-8 h-8 text-white" />
-              </div>
+              <img src="/Neomemory-logo.png" alt="Neo Memory Logo" className="w-12 h-12" />
               <div>
-                <h1 className="text-3xl font-bold bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">
-                  NeoMemory Dashboard
+                <h1 className="text-3xl font-bold bg-gradient-to-r from-white to-slate-100 bg-clip-text text-transparent">
+                  Neo Memory Dashboard
                 </h1>
                 <p className="text-slate-400">Manage your memories and API keys</p>
               </div>
@@ -164,24 +186,20 @@ const Dashboard = () => {
           </div>
 
           <Tabs defaultValue="api-keys" className="space-y-8">
-            <TabsList className="grid w-full grid-cols-5 max-w-4xl mx-auto bg-slate-900/50 shadow-elegant border border-slate-800">
-              <TabsTrigger value="api-keys" className="gap-2 text-slate-300 data-[state=active]:text-white">
+            <TabsList className="grid w-full grid-cols-4 max-w-4xl mx-auto bg-slate-900/50 shadow-elegant border border-slate-800">
+              <TabsTrigger value="api-keys" className="gap-2 text-slate-300 data-[state=active]:text-black">
                 <Key className="w-4 h-4" />
                 API Keys
               </TabsTrigger>
-              <TabsTrigger value="store" className="gap-2 text-slate-300 data-[state=active]:text-white">
+              <TabsTrigger value="store" className="gap-2 text-slate-300 data-[state=active]:text-black">
                 <Database className="w-4 h-4" />
                 Store
               </TabsTrigger>
-              <TabsTrigger value="retrieve" className="gap-2 text-slate-300 data-[state=active]:text-white">
-                <Search className="w-4 h-4" />
-                Search
-              </TabsTrigger>
-              <TabsTrigger value="memories" className="gap-2 text-slate-300 data-[state=active]:text-white">
-                <Brain className="w-4 h-4" />
+              <TabsTrigger value="memories" className="gap-2 text-slate-300 data-[state=active]:text-black">
+                <BookOpen className="w-4 h-4" />
                 Memories
               </TabsTrigger>
-              <TabsTrigger value="settings" className="gap-2 text-slate-300 data-[state=active]:text-white">
+              <TabsTrigger value="settings" className="gap-2 text-slate-300 data-[state=active]:text-black">
                 <Settings className="w-4 h-4" />
                 Settings
               </TabsTrigger>
@@ -242,11 +260,14 @@ const Dashboard = () => {
                               )}
                             </Button>
                           </div>
-                          {/* Show API key below the name in larger font */}
+                          {/* Show full API key below the name */}
                           <div className="mb-2">
-                            <span className="text-sm font-mono text-green-300 bg-slate-900 px-2 py-1 rounded break-all select-all">
-                              {key.key}
-                            </span>
+                            <Label className="text-xs text-slate-400 mb-1 block">API Key:</Label>
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-mono text-green-300 bg-slate-900 px-3 py-2 rounded break-all select-all flex-1">
+                                {key.key}
+                              </span>
+                            </div>
                           </div>
                           <div className="flex items-center gap-4 text-xs text-slate-500">
                             <span>Usage: {key.usage_count}</span>
@@ -266,24 +287,14 @@ const Dashboard = () => {
                     <Database className="w-5 h-5 text-blue-400" />
                     Store New Memory
                   </h3>
-                  <StoreMemorySection apiKey={activeApiKey} onMemoryStored={handleMemoryStored} />
-                </Card>
-              </TabsContent>
-
-              <TabsContent value="retrieve" className="space-y-6">
-                <Card className="p-6 bg-slate-900/50 border-slate-800 shadow-elegant">
-                  <h3 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
-                    <Search className="w-5 h-5 text-purple-400" />
-                    Search Memories
-                  </h3>
-                  <RetrieveMemorySection apiKey={activeApiKey} />
+                  <StoreMemorySection apiKey={activeApiKey} apiKeys={apiKeys} onMemoryStored={handleMemoryStored} />
                 </Card>
               </TabsContent>
 
               <TabsContent value="memories" className="space-y-6">
                 <Card className="p-6 bg-slate-900/50 border-slate-800 shadow-elegant">
                   <h3 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
-                    <Brain className="w-5 h-5 text-green-400" />
+                    <BookOpen className="w-5 h-5 text-green-400" />
                     All Memories
                   </h3>
                   <MemoryListSection apiKey={activeApiKey} refreshTrigger={refreshMemories} />

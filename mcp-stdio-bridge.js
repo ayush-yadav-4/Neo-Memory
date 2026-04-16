@@ -11,7 +11,7 @@ const path = require('path');
 
 // Configuration
 const API_URL = 'http://localhost:8787/mcp-server';
-const API_KEY = process.env.API_KEY; // No fallback in repo
+const API_KEY = process.env.API_KEY || 'sk_mem_b906ee732a0d7de8116a06ac18b1d641f2f7ef733ad426805693c3cd871f0048';
 const SERVER_PATH = path.join(__dirname, 'server', 'start.ts');
 
 // Start the HTTP server in the background
@@ -59,7 +59,7 @@ async function makeHttpRequest(data) {
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(postData),
-        ...(API_KEY ? { 'X-API-Key': API_KEY } : {})
+        'X-API-Key': API_KEY
       }
     };
 

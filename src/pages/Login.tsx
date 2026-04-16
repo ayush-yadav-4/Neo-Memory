@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Brain, LogIn } from 'lucide-react';
+import { LogIn } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -43,16 +43,14 @@ const Login = () => {
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 flex items-center justify-center px-6">
       <Card className="w-full max-w-md p-8 space-y-6 bg-slate-900/50 border-slate-800">
         <div className="flex items-center gap-3 mb-6">
-          <div className="p-2 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600">
-            <Brain className="w-8 h-8 text-white" />
-          </div>
+          <img src="/Neomemory-logo.png" alt="Neo Memory Logo" className="w-12 h-12" />
           <h1 className="text-2xl font-bold bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">Log In</h1>
         </div>
         <div className="space-y-4">
           <div><Label className="text-slate-300">Email</Label><Input className="bg-slate-800 border-slate-700 text-white mt-2" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" /></div>
           <div><Label className="text-slate-300">Password</Label><Input type="password" className="bg-slate-800 border-slate-700 text-white mt-2" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" /></div>
         </div>
-        <Button onClick={handleLogin} disabled={loading} className="w-full bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700 text-white">
+        <Button onClick={handleLogin} disabled={loading} className="w-full bg-blue-600 hover:bg-blue-700 text-white">
           {loading ? 'Logging in...' : (<><LogIn className="w-4 h-4 mr-2" />Log In</>)}
         </Button>
         <Button variant="link" onClick={() => navigate('/signup')} className="text-blue-400 hover:text-blue-300">Don't have an account? Sign up</Button>

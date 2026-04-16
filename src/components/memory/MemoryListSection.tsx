@@ -54,18 +54,31 @@ const MemoryListSection = ({ apiKey, refreshTrigger }: MemoryListSectionProps) =
     }
   };
 
-  const loadMemories = async () => {
-    if (!apiKey) return;
+  const loadMemories = async (keyToUse?: string) => {
+    const key = keyToUse || selectedApiKey || apiKey;
+    if (!key) {
+      setMemories([]);
+      setAllMemories([]);
+      return;
+    }
 
     setIsLoading(true);
     try {
       const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8787';
+      
+      // Get the full API key string
+      const fullApiKey = key.startsWith('sk_mem_') ? key : apiKeys.find(k => k.id === key)?.key || key;
+      
+      if (!fullApiKey) {
+        throw new Error('API key not found');
+      }
+
       const response = await fetch(
-        `${apiBase}/list-memories?limit=50`,
+        `${apiBase}/list-memories?limit=100`,
         {
           method: 'GET',
           headers: {
-            'X-API-Key': apiKey,
+            'X-API-Key': fullApiKey,
           },
           credentials: 'include',
         }
@@ -80,82 +93,35 @@ const MemoryListSection = ({ apiKey, refreshTrigger }: MemoryListSectionProps) =
       const memoriesData = data.memories || [];
       setAllMemories(memoriesData);
       setMemories(memoriesData);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error listing memories:', error);
       toast({
         title: 'Error',
-        description: 'Failed to load memories',
+        description: error.message || 'Failed to load memories from database',
         variant: 'destructive',
       });
+      setMemories([]);
+      setAllMemories([]);
     } finally {
       setIsLoading(false);
     }
   };
 
   const filterMemories = async () => {
-    let filtered: Memory[] = [];
-
     // If no API key selected, show empty state
     if (!selectedApiKey) {
       setMemories([]);
+      setAllMemories([]);
       return;
     }
 
-    // Filter by API key - fetch memories for specific API key
-    try {
-      const selectedKey = apiKeys.find(key => key.id === selectedApiKey);
-      if (selectedKey) {
-        const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8787';
-        const response = await fetch(
-          `${apiBase}/list-memories?limit=50`,
-          {
-            method: 'GET',
-            headers: {
-              'X-API-Key': selectedKey.key,
-            },
-            credentials: 'include',
-          }
-        );
-
-        if (response.ok) {
-          const data = await response.json();
-          filtered = data.memories || [];
-        } else {
-          console.error('Failed to fetch memories for selected API key');
-          toast({
-            title: 'Error',
-            description: 'Failed to load memories for selected API key',
-            variant: 'destructive',
-          });
-          return;
-        }
-      } else {
-        console.error('Selected API key not found');
-        return;
-      }
-    } catch (error) {
-      console.error('Error filtering by API key:', error);
-      toast({
-        title: 'Error',
-        description: 'Failed to filter memories by API key',
-        variant: 'destructive',
-      });
-      return;
-    }
-
-    // Filter by search query
-    if (searchQuery.trim()) {
-      filtered = filtered.filter(memory =>
-        memory.content.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        memory.metadata?.category?.toLowerCase().includes(searchQuery.toLowerCase())
-      );
-    }
-
-    setMemories(filtered);
+    // Load memories for the selected API key
+    await loadMemories(selectedApiKey);
   };
 
   const handleDelete = async (memoryId: string) => {
-    if (!apiKey) return;
+    const keyToUse = selectedApiKey ? apiKeys.find(k => k.id === selectedApiKey)?.key : apiKey;
+    if (!keyToUse) return;
 
     try {
       const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8787';
@@ -165,7 +131,7 @@ const MemoryListSection = ({ apiKey, refreshTrigger }: MemoryListSectionProps) =
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'X-API-Key': apiKey,
+            'X-API-Key': keyToUse,
           },
           credentials: 'include',
           body: JSON.stringify({ memoryId }),
@@ -203,14 +169,40 @@ const MemoryListSection = ({ apiKey, refreshTrigger }: MemoryListSectionProps) =
   }, [apiKey]);
 
   useEffect(() => {
+    if (apiKeys.length > 0 && !selectedApiKey) {
+      // Auto-select first API key if none selected
+      setSelectedApiKey(apiKeys[0].id);
+    }
+  }, [apiKeys]);
+
+  useEffect(() => {
     if (refreshTrigger && refreshTrigger > 0) {
-      loadMemories();
+      if (selectedApiKey) {
+        loadMemories(selectedApiKey);
+      } else if (apiKey) {
+        loadMemories(apiKey);
+      }
     }
   }, [refreshTrigger]);
 
   useEffect(() => {
-    filterMemories();
-  }, [selectedApiKey, searchQuery, apiKeys]);
+    if (selectedApiKey && apiKeys.length > 0) {
+      filterMemories();
+    }
+  }, [selectedApiKey]);
+
+  useEffect(() => {
+    // Filter by search query from already loaded memories
+    if (searchQuery.trim() && allMemories.length > 0) {
+      const filtered = allMemories.filter(memory =>
+        memory.content.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        memory.metadata?.category?.toLowerCase().includes(searchQuery.toLowerCase())
+      );
+      setMemories(filtered);
+    } else if (allMemories.length > 0) {
+      setMemories(allMemories);
+    }
+  }, [searchQuery, allMemories]);
 
   return (
     <Card className="shadow-elegant border-slate-800 bg-slate-900/50">
@@ -230,8 +222,14 @@ const MemoryListSection = ({ apiKey, refreshTrigger }: MemoryListSectionProps) =
           <Button
             variant="outline"
             size="sm"
-            onClick={loadMemories}
-            disabled={isLoading || !apiKey}
+            onClick={() => {
+              if (selectedApiKey) {
+                loadMemories(selectedApiKey);
+              } else if (apiKey) {
+                loadMemories(apiKey);
+              }
+            }}
+            disabled={isLoading || (!selectedApiKey && !apiKey)}
             className="border-slate-700 text-slate-300 hover:bg-slate-800"
           >
             {isLoading ? (
@@ -332,13 +330,7 @@ const MemoryListSection = ({ apiKey, refreshTrigger }: MemoryListSectionProps) =
           </div>
         )}
 
-        {!apiKey && (
-          <p className="text-sm text-orange-400 text-center py-8">
-            Please generate an API key first in the API Key tab
-          </p>
-        )}
-
-        {apiKey && apiKeys.length === 0 && (
+        {apiKeys.length === 0 && (
           <p className="text-sm text-orange-400 text-center py-8">
             No API keys found. Generate an API key first to view memories.
           </p>

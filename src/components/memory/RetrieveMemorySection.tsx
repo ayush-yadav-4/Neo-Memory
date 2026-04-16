@@ -125,7 +125,7 @@ const RetrieveMemorySection = ({ apiKey }: RetrieveMemorySectionProps) => {
             <Button 
               onClick={handleSearch} 
               disabled={isLoading || !apiKey || !query.trim()}
-              className="bg-gradient-to-r from-purple-500 to-pink-600 hover:from-purple-600 hover:to-pink-700 text-white"
+              className="bg-blue-600 hover:bg-blue-700 text-white"
             >
               {isLoading ? (
                 <Loader2 className="w-4 h-4 animate-spin" />

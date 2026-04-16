@@ -3,7 +3,7 @@
     "memory-api": {
       "url": "http://localhost:8787/mcp-server",
       "headers": {
-        "X-API-Key": "YOUR_API_KEY_HERE"
+        "X-API-Key": "sk_mem_b906ee732a0d7de8116a06ac18b1d641f2f7ef733ad426805693c3cd871f0048"
       }
     }
   }

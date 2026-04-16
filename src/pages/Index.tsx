@@ -1,19 +1,24 @@
 import { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Brain, ArrowRight, Sparkles, LogIn, UserPlus } from 'lucide-react';
+import { ArrowRight, Sparkles, LogIn, UserPlus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
-import { supabase } from '@/integrations/supabase/client';
 
 const Index = () => {
   const navigate = useNavigate();
 
   useEffect(() => {
-    // Check if user is already logged in
+    // Check if user is already logged in using session cookies
     const checkUser = async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (session) {
-        navigate('/dashboard');
+      try {
+        const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8787';
+        const response = await fetch(`${apiBase}/auth/me`, { credentials: 'include' });
+        const data = await response.json();
+        if (data.authenticated) {
+          navigate('/dashboard');
+        }
+      } catch (error) {
+        // User not authenticated, stay on landing page
       }
     };
     checkUser();
@@ -26,11 +31,9 @@ const Index = () => {
         <div className="container mx-auto px-6 py-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <div className="p-2 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 shadow-lg">
-                <Brain className="w-8 h-8 text-white" />
-              </div>
+              <img src="/Neomemory-logo.png" alt="Neo Memory Logo" className="w-12 h-12" />
               <h1 className="text-2xl font-bold bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">
-                NeoMemory
+                Neo Memory
               </h1>
             </div>
             
@@ -66,7 +69,7 @@ const Index = () => {
               </Button>
               <Button 
                 onClick={() => navigate('/signup')}
-                className="bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700 text-white"
+                className="bg-blue-600 hover:bg-blue-700 text-white"
               >
                 <UserPlus className="w-4 h-4 mr-2" />
                 Sign Up
@@ -80,11 +83,9 @@ const Index = () => {
       <div className="container mx-auto px-6 py-20">
         <div className="text-center max-w-4xl mx-auto">
           <div className="flex items-center justify-center gap-3 mb-8">
-            <div className="p-4 rounded-2xl bg-gradient-to-br from-blue-500 to-purple-600 shadow-2xl">
-              <Brain className="w-12 h-12 text-white" />
-            </div>
+            <img src="/Neomemory-logo.png" alt="Neo Memory Logo" className="w-20 h-20" />
             <h1 className="text-6xl font-bold bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">
-              NeoMemory
+              Neo Memory
             </h1>
           </div>
           
@@ -97,7 +98,7 @@ const Index = () => {
           <div className="flex flex-col sm:flex-row gap-4 justify-center items-center mb-12">
             <Button 
               size="lg" 
-              className="bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700 text-white px-8 py-3 text-lg font-semibold shadow-lg hover:shadow-xl transition-all duration-300"
+              className="bg-blue-600 hover:bg-blue-700 text-white px-8 py-3 text-lg font-semibold shadow-lg hover:shadow-xl transition-all duration-300"
               onClick={() => navigate('/login')}
             >
               Get Started
@@ -118,7 +119,7 @@ const Index = () => {
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-16">
             <Card className="p-6 bg-slate-900/50 border-slate-800 shadow-elegant hover:shadow-xl transition-all duration-300">
               <div className="p-3 rounded-xl bg-blue-500/20 w-fit mx-auto mb-4">
-                <Brain className="w-8 h-8 text-blue-400" />
+                <ArrowRight className="w-8 h-8 text-blue-400" />
               </div>
               <h3 className="text-xl font-semibold text-white mb-2">Semantic Search</h3>
               <p className="text-slate-400">

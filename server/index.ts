@@ -2,6 +2,54 @@ import 'dotenv/config';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { neon } from '@neondatabase/serverless';
+import { connectDB } from './db';
+import { Conversation } from './models/Conversation';
+import { storeChatMemory, retrieveChatMemory, getRelevantMemories } from './chat-memory-manager';
+import { storeDocument, searchDocumentChunks, listDocuments, getDocument, deleteDocument } from './document-manager';
+type PDFParseResult = { text: string; [k: string]: any };
+type MammothResult = { value: string; messages: any[] };
+
+async function extractFileText(buffer: Buffer, filename: string, mimeType: string): Promise<string> {
+  const ext = filename.split('.').pop()?.toLowerCase() || '';
+
+  const finalize = (raw: string) =>
+    raw.replace(/\r/g, '').replace(/\u0000/g, '').trim();
+
+  type PdfParseModule = { default: (data: Buffer | Uint8Array) => Promise<PDFParseResult> };
+  const loadPdfParse = async (): Promise<(data: Buffer | Uint8Array) => Promise<PDFParseResult>> =>
+    (await import('pdf-parse') as unknown as PdfParseModule).default;
+
+  if (mimeType.startsWith('text/') || ['txt', 'md', 'csv'].includes(ext)) {
+    return finalize(buffer.toString('utf8'));
+  }
+
+  if (ext === 'pdf') {  
+    try {
+      const pdfParse = (await import('pdf-parse')).default as (b: Buffer) => Promise<PDFParseResult>;
+      const data = await pdfParse(buffer);
+      return finalize(data.text || '');
+    } catch (e) {
+      console.warn('[extractFileText] pdf-parse unavailable or failed:', (e as Error).message);
+      return '';
+    }
+  }
+
+  if (ext === 'docx') {
+    try {
+      const mammoth = await import('mammoth');
+      const result = (await mammoth.extractRawText({ buffer })) as MammothResult;
+      return finalize(result.value || '');
+    } catch (e) {
+      console.warn('[extractFileText] mammoth unavailable or failed:', (e as Error).message);
+      return '';
+    }
+  }
+
+  return '';
+}
+
+import { chatWithAI } from '../src/lib/ai-models/index';
+import type { AIProvider, ChatRequest, ChatResponse, Message } from '../src/lib/ai-models/types';
 
 const app = new Hono();
 
@@ -12,12 +60,10 @@ app.use('*', cors({
   credentials: true,
 }));
 
-// Database connection with retry
 const sql = (() => {
-  const url = process.env.NEON_DATABASE_URL || process.env.DATABASE_URL;
-  if (!url) throw new Error('NEON_DATABASE_URL (or DATABASE_URL) is not set');
-
-  // Create connection with timeout and retry settings
+  const url = "postgresql://neondb_owner:npg_mnYcx94zhvyO@ep-patient-salad-adc0tdsy-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
+  if (!url) throw new Error('NEON_DATABASE_URL is not set');
+  
   return neon(url, {
     fetchOptions: {
       timeout: 30000, // 30 second timeout
@@ -44,21 +90,25 @@ async function getUserFromSession(c: any) {
 }
 
 async function verifyApiKeyOwnership(apiKey: string, userId: string) {
-  const keyRows = await sql`
-    SELECT id, is_active, user_id 
-    FROM public.api_keys 
-    WHERE key = ${apiKey} AND user_id = ${userId} 
-    LIMIT 1
-  `;
-  return keyRows[0] || null;
+  try {
+    const result = await sql`
+      SELECT user_id 
+      FROM api_keys 
+      WHERE key = ${apiKey} 
+      AND user_id = ${userId} 
+      AND is_active = true
+    `;
+    return result.length > 0;
+  } catch (error: any) {
+    console.error('❌ API key verification error:', error);
+    return false;
+  }
 }
 
-// Ensure required schema exists (idempotent)
 async function ensureSchema() {
   await sql`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`;
   await sql`CREATE EXTENSION IF NOT EXISTS vector`;
 
-  // Create users table first (no dependencies)
   await sql`
     CREATE TABLE IF NOT EXISTS public.users (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -68,7 +118,6 @@ async function ensureSchema() {
     )
   `;
 
-  // Create sessions table (depends on users)
   await sql`
     CREATE TABLE IF NOT EXISTS public.sessions (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -79,7 +128,6 @@ async function ensureSchema() {
     )
   `;
 
-  // Create api_keys table (depends on users)
   await sql`
     CREATE TABLE IF NOT EXISTS public.api_keys (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -99,7 +147,6 @@ async function ensureSchema() {
   await sql`CREATE INDEX IF NOT EXISTS idx_api_keys_key ON public.api_keys(key)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON public.api_keys(user_id)`;
   
-  // Update all existing API keys to be active
   await sql`UPDATE public.api_keys SET is_active = true WHERE is_active = false`;
 
   await sql`
@@ -131,7 +178,6 @@ async function ensureSchema() {
   await sql`CREATE INDEX IF NOT EXISTS idx_api_key_usage_key_timestamp ON public.api_key_usage(api_key_id, timestamp DESC)`;
 }
 
-// Run schema check on startup (non-blocking log errors)
 (async () => {
   try {
     await ensureSchema();
@@ -182,132 +228,254 @@ app.post('/generate-api-key', async (c) => {
 });
 
 app.post('/store-memory', async (c) => {
-  const apiKey = c.req.header('x-api-key');
-  if (!apiKey) return c.json({ error: 'X-API-Key required' }, 401);
-  
-  // Get user from session for additional security
-  const session = await getUserFromSession(c);
-  if (!session) return c.json({ error: 'Authentication required' }, 401);
-  
-  const key = await verifyApiKeyOwnership(apiKey, session.user_id);
-  if (!key || !key.is_active) return c.json({ error: 'Invalid or inactive API key' }, 401);
-  
-  // Update usage count
-  await sql`UPDATE public.api_keys SET usage_count = usage_count + 1, last_used_at = NOW() WHERE id = ${key.id}`;
+  try {
+    const apiKey = c.req.header('x-api-key') || c.req.header('X-API-Key');
+    
+    if (!apiKey) {
+      console.error('[Store Memory] Missing X-API-Key header');
+      return c.json({ error: 'X-API-Key required' }, 401);
+    }
+    
+    const session = await getUserFromSession(c);
+    const trimmedApiKey = apiKey.trim();
+    
+    console.log('[Store Memory] Verifying API key:', {
+      apiKeyPrefix: trimmedApiKey.substring(0, 15) + '...',
+      userId: session?.user_id || 'no session'
+    });
+    
+    const keyRows = await sql`
+      SELECT id, is_active, user_id, name
+      FROM public.api_keys 
+      WHERE key = ${trimmedApiKey} AND is_active = true 
+      LIMIT 1
+    `;
+    
+    if (keyRows.length === 0) {
+      console.error('[Store Memory] API key not found or inactive:', {
+        apiKeyPrefix: trimmedApiKey.substring(0, 15) + '...'
+      });
+      return c.json({ error: 'Invalid or inactive API key. Please check that the API key exists and is active.' }, 401);
+    }
+    
+    const key = keyRows[0];
+    
+    if (session && key.user_id !== session.user_id) {
+      console.warn('[Store Memory] API key belongs to different user, but allowing:', {
+        keyUserId: key.user_id,
+        sessionUserId: session.user_id
+      });
+    }
+    
+    console.log('[Store Memory] API key verified successfully:', {
+      keyId: key.id,
+      keyName: key.name,
+      isActive: key.is_active,
+      userId: key.user_id
+    });
+    
+    await sql`UPDATE public.api_keys SET usage_count = usage_count + 1, last_used_at = NOW() WHERE id = ${key.id}`;
 
-  const { content, metadata } = await c.req.json();
-  if (!content || typeof content !== 'string') return c.json({ error: 'content required' }, 400);
+    const { content, metadata } = await c.req.json();
+    if (!content || typeof content !== 'string') {
+      return c.json({ error: 'content required' }, 400);
+    }
 
-  const cohereKey = process.env.COHERE_API_KEY;
-  if (!cohereKey) return c.json({ error: 'Server missing COHERE_API_KEY' }, 500);
+    const cohereKey = "Z6OW9Khqf4GsBCrWxHCJZWO3ww5lSPy11oWPGw8U";
+    if (!cohereKey) {
+      return c.json({ error: 'Server missing COHERE_API_KEY' }, 500);
+    }
 
-  const cohereResp = await fetch('https://api.cohere.ai/v1/embed', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${cohereKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ texts: [content], model: 'embed-english-v3.0', input_type: 'search_document' })
-  });
-  if (!cohereResp.ok) return c.json({ error: 'Embedding failed' }, 500);
-  const cohereData = await cohereResp.json();
-  const embedding: number[] = cohereData.embeddings[0];
+    const cohereResp = await fetch('https://api.cohere.ai/v1/embed', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${cohereKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ texts: [content], model: 'embed-english-v3.0', input_type: 'search_document' })
+    });
+    
+    if (!cohereResp.ok) {
+      const errorText = await cohereResp.text();
+      console.error('[Store Memory] Cohere embedding failed:', errorText);
+      return c.json({ error: 'Embedding failed' }, 500);
+    }
+    
+    const cohereData = await cohereResp.json();
+    const embedding: number[] = cohereData.embeddings[0];
 
-  const rows = await sql`
-    INSERT INTO public.memories (content, embedding, metadata, api_key_id)
-    VALUES (${content}, ${`[${embedding.join(',')}]`}::vector, ${metadata ? JSON.stringify(metadata) : null}::jsonb, ${key.id})
-    RETURNING id, content, metadata, created_at
-  `;
-  const data = rows[0];
-  return c.json({ success: true, memory: data });
+    const rows = await sql`
+      INSERT INTO public.memories (content, embedding, metadata, api_key_id)
+      VALUES (${content}, ${`[${embedding.join(',')}]`}::vector, ${metadata ? JSON.stringify(metadata) : null}::jsonb, ${key.id})
+      RETURNING id, content, metadata, created_at
+    `;
+    const data = rows[0];
+    
+    console.log('[Store Memory] Memory stored successfully:', {
+      memoryId: data.id,
+      apiKeyId: key.id
+    });
+    
+    return c.json({ success: true, memory: data }, 200);
+  } catch (error: any) {
+    console.error('[Store Memory] Unexpected error:', {
+      message: error.message,
+      stack: error.stack
+    });
+    return c.json({ error: 'Failed to store memory: ' + error.message }, 500);
+  }
 });
 
 app.post('/retrieve-memories', async (c) => {
-  const apiKey = c.req.header('x-api-key');
-  if (!apiKey) return c.json({ error: 'X-API-Key required' }, 401);
-  
-  // Get user from session for additional security
-  const session = await getUserFromSession(c);
-  if (!session) return c.json({ error: 'Authentication required' }, 401);
-  
-  const key = await verifyApiKeyOwnership(apiKey, session.user_id);
-  if (!key || !key.is_active) return c.json({ error: 'Invalid or inactive API key' }, 401);
-  
-  // Update usage count
-  await sql`UPDATE public.api_keys SET usage_count = usage_count + 1, last_used_at = NOW() WHERE id = ${key.id}`;
+  try {
+    const apiKey = c.req.header('x-api-key');
+    if (!apiKey) {
+      return c.json({ error: 'API key is required' }, 401);
+    }
 
-  const { query, limit = 5 } = await c.req.json();
-  if (!query || typeof query !== 'string') return c.json({ error: 'query required' }, 400);
+    const keyRows = await sql`
+      SELECT id, user_id, is_active 
+      FROM public.api_keys 
+      WHERE key = ${apiKey} 
+      AND is_active = true 
+      LIMIT 1
+    `;
 
-  const cohereKey = "Z6OW9Khqf4GsBCrWxHCJZWO3ww5lSPy11oWPGw8U";
-  if (!cohereKey) return c.json({ error: 'Server missing COHERE_API_KEY' }, 500);
+    if (keyRows.length === 0) {
+      return c.json({ error: 'Invalid or inactive API key' }, 403);
+    }
 
-  const cohereResp = await fetch('https://api.cohere.ai/v1/embed', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${cohereKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ texts: [query], model: 'embed-english-v3.0', input_type: 'search_query' })
-  });
-  if (!cohereResp.ok) return c.json({ error: 'Embedding failed' }, 500);
-  const cohereData = await cohereResp.json();
-  const queryEmbedding: number[] = cohereData.embeddings[0];
-  const embeddingString = `[${queryEmbedding.join(',')}]`;
+    const key = keyRows[0];
 
-  const rows = await sql`
-    SELECT id, content, metadata, created_at,
-           1 - (embedding <=> ${embeddingString}::vector) AS similarity
-    FROM public.memories
-    WHERE api_key_id = ${key.id}
-      AND 1 - (embedding <=> ${embeddingString}::vector) > 0.5
-    ORDER BY embedding <=> ${embeddingString}::vector
-    LIMIT ${limit}
-  `;
-  return c.json({ success: true, query, count: rows.length, memories: rows });
+    const body = await c.req.json();
+    const { query, limit = 10 } = body;
+
+    if (!query) {
+      return c.json({ error: 'Query is required' }, 400);
+    }
+
+    const cohereKey = "Z6OW9Khqf4GsBCrWxHCJZWO3ww5lSPy11oWPGw8U";
+    const cohereResp = await fetch('https://api.cohere.ai/v1/embed', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${cohereKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        texts: [query],
+        model: 'embed-english-v3.0',
+        input_type: 'search_query'
+      })
+    });
+
+    if (!cohereResp.ok) {
+      return c.json({ error: 'Embedding failed' }, 500);
+    }
+
+    const cohereData = await cohereResp.json();
+    const queryEmbedding: number[] = cohereData.embeddings[0];
+
+    const memories = await sql`
+      SELECT id, content, metadata, created_at,
+             (embedding <=> ${`[${queryEmbedding.join(',')}]`}::vector) as distance
+      FROM public.memories
+      WHERE api_key_id = ${key.id}
+      ORDER BY distance
+      LIMIT ${limit}
+    `;
+
+    const results = memories.map((m: any) => ({
+      id: m.id,
+      content: m.content,
+      metadata: m.metadata,
+      similarity: 1 - m.distance,
+      created_at: m.created_at
+    }));
+
+    return c.json({ 
+      success: true, 
+      memories: results,
+      count: results.length 
+    });
+  } catch (error: any) {
+    console.error('❌ Retrieve memories error:', error);
+    return c.json({ error: error.message || 'Failed to retrieve memories' }, 500);
+  }
 });
 
 app.get('/list-memories', async (c) => {
-  const apiKey = c.req.header('x-api-key');
-  if (!apiKey) return c.json({ error: 'X-API-Key required' }, 401);
-  
-  // Get user from session for additional security
-  const session = await getUserFromSession(c);
-  if (!session) return c.json({ error: 'Authentication required' }, 401);
-  
-  const key = await verifyApiKeyOwnership(apiKey, session.user_id);
-  if (!key || !key.is_active) return c.json({ error: 'Invalid or inactive API key' }, 401);
-  
-  // Update usage count
-  await sql`UPDATE public.api_keys SET usage_count = usage_count + 1, last_used_at = NOW() WHERE id = ${key.id}`;
+  try {
+    const apiKey = c.req.header('x-api-key');
+    if (!apiKey) return c.json({ error: 'X-API-Key required' }, 401);
+    
+    const session = await getUserFromSession(c);
+    if (!session) return c.json({ error: 'Authentication required' }, 401);
+    
+    const keyRows = await sql`
+      SELECT id, user_id, is_active 
+      FROM public.api_keys 
+      WHERE key = ${apiKey} 
+      AND user_id = ${session.user_id}
+      AND is_active = true 
+      LIMIT 1
+    `;
+    
+    if (keyRows.length === 0) {
+      return c.json({ error: 'Invalid or inactive API key' }, 401);
+    }
+    
+    const key = keyRows[0];
+    
+    await sql`UPDATE public.api_keys SET usage_count = usage_count + 1, last_used_at = NOW() WHERE id = ${key.id}`;
 
-  const url = new URL(c.req.url);
-  const limit = parseInt(url.searchParams.get('limit') || '50', 10);
-  const rows = await sql`
-    SELECT id, content, metadata, created_at, updated_at
-    FROM public.memories
-    WHERE api_key_id = ${key.id}
-    ORDER BY created_at DESC
-    LIMIT ${limit}
-  `;
-  return c.json({ success: true, count: rows.length, memories: rows });
+    const url = new URL(c.req.url);
+    const limit = parseInt(url.searchParams.get('limit') || '50', 10);
+    const rows = await sql`
+      SELECT id, content, metadata, created_at, updated_at
+      FROM public.memories
+      WHERE api_key_id = ${key.id}
+      ORDER BY created_at DESC
+      LIMIT ${limit}
+    `;
+    return c.json({ success: true, count: rows.length, memories: rows });
+  } catch (error: any) {
+    console.error('❌ List memories error:', error);
+    return c.json({ error: error.message || 'Failed to list memories' }, 500);
+  }
 });
 
 app.post('/delete-memory', async (c) => {
-  const apiKey = c.req.header('x-api-key');
-  if (!apiKey) return c.json({ error: 'X-API-Key required' }, 401);
-  
-  // Get user from session for additional security
-  const session = await getUserFromSession(c);
-  if (!session) return c.json({ error: 'Authentication required' }, 401);
-  
-  const key = await verifyApiKeyOwnership(apiKey, session.user_id);
-  if (!key || !key.is_active) return c.json({ error: 'Invalid or inactive API key' }, 401);
-  
-  // Update usage count
-  await sql`UPDATE public.api_keys SET usage_count = usage_count + 1, last_used_at = NOW() WHERE id = ${key.id}`;
+  try {
+    const apiKey = c.req.header('x-api-key');
+    if (!apiKey) return c.json({ error: 'X-API-Key required' }, 401);
+    
+    const session = await getUserFromSession(c);
+    if (!session) return c.json({ error: 'Authentication required' }, 401);
+    
+    const keyRows = await sql`
+      SELECT id, user_id, is_active 
+      FROM public.api_keys 
+      WHERE key = ${apiKey} 
+      AND user_id = ${session.user_id}
+      AND is_active = true 
+      LIMIT 1
+    `;
+    
+    if (keyRows.length === 0) {
+      return c.json({ error: 'Invalid or inactive API key' }, 401);
+    }
+    
+    const key = keyRows[0];
+    
+    await sql`UPDATE public.api_keys SET usage_count = usage_count + 1, last_used_at = NOW() WHERE id = ${key.id}`;
 
-  const { memoryId } = await c.req.json();
-  if (!memoryId) return c.json({ error: 'memoryId required' }, 400);
-  await sql`DELETE FROM public.memories WHERE id = ${memoryId} AND api_key_id = ${key.id}`;
-  return c.json({ success: true, message: 'Memory deleted successfully' });
+    const { memoryId } = await c.req.json();
+    if (!memoryId) return c.json({ error: 'memoryId required' }, 400);
+    await sql`DELETE FROM public.memories WHERE id = ${memoryId} AND api_key_id = ${key.id}`;
+    return c.json({ success: true, message: 'Memory deleted successfully' });
+  } catch (error: any) {
+    console.error('❌ Delete memory error:', error);
+    return c.json({ error: error.message || 'Failed to delete memory' }, 500);
+  }
 });
 
-// Manage API Keys endpoints for UI compatibility
 app.get('/manage-api-keys', async (c) => {
   const url = new URL(c.req.url);
   const action = url.searchParams.get('action');
@@ -324,8 +492,8 @@ app.get('/manage-api-keys', async (c) => {
       WHERE user_id = ${userId}
       ORDER BY created_at DESC
     `;
-    const masked = rows.map((k: any) => ({ ...k, key: `****${String(k.key).slice(-8)}` }));
-    return c.json({ success: true, count: rows.length, keys: masked });
+    // Return full keys without masking - user owns these keys
+    return c.json({ success: true, count: rows.length, keys: rows });
   }
 
   if (action === 'stats') {
@@ -405,7 +573,6 @@ app.delete('/manage-api-keys', async (c) => {
   return c.json({ success: true });
 });
 
-// Streamable HTTP MCP endpoint for Chrome Extension
 app.get('/mcp-stream', async (c) => {
   const apiKey = c.req.header('x-api-key') || c.req.query('api_key');
   
@@ -413,17 +580,14 @@ app.get('/mcp-stream', async (c) => {
     return c.json({ error: 'API key required' }, 401);
   }
 
-  // Set up Server-Sent Events headers
   c.header('Content-Type', 'text/event-stream');
   c.header('Cache-Control', 'no-cache');
   c.header('Connection', 'keep-alive');
   c.header('Access-Control-Allow-Origin', '*');
   c.header('Access-Control-Allow-Headers', 'Cache-Control');
 
-  // Send initial connection event
   const stream = new ReadableStream({
     start(controller) {
-      // Send server info
       const serverInfo = {
         jsonrpc: '2.0',
         method: 'server/info',
@@ -452,20 +616,15 @@ app.get('/mcp-stream', async (c) => {
   });
 });
 
-// MCP Server endpoint (JSON-RPC over HTTP)
-// Get or create a default API key for MCP usage
 app.get('/mcp-api-key', async (c) => {
   try {
-    // Look for existing MCP API key
     let key = await sql`SELECT key, name, expires_at FROM public.api_keys WHERE name LIKE '%MCP%' AND is_active = true ORDER BY created_at DESC LIMIT 1`;
     
     if (!key[0]) {
-      // Create a test user first
       const testEmail = 'mcp-auto@example.com';
       const testPassword = 'mcp123';
       const passwordHash = Buffer.from(testPassword).toString('base64');
       
-      // Check if test user exists, if not create one
       let user = await sql`SELECT id FROM public.users WHERE email = ${testEmail} LIMIT 1`;
       if (!user[0]) {
         const newUser = await sql`
@@ -476,7 +635,6 @@ app.get('/mcp-api-key', async (c) => {
         user = newUser;
       }
       
-      // Generate API key
       const newApiKey = `mcp_${crypto.randomUUID().replace(/-/g, '')}`;
       const expiresAt = new Date();
       expiresAt.setFullYear(expiresAt.getFullYear() + 1);
@@ -503,17 +661,14 @@ app.get('/mcp-api-key', async (c) => {
   }
 });
 
-// Create a test API key for MCP usage (no authentication required)
 app.post('/create-test-api-key', async (c) => {
   try {
     const { name = 'MCP Test Key' } = await c.req.json().catch(() => ({}));
     
-    // Create a test user first
     const testEmail = 'mcp-test@example.com';
     const testPassword = 'test123';
     const passwordHash = Buffer.from(testPassword).toString('base64'); // Simple encoding for test
     
-    // Check if test user exists, if not create one
     let user = await sql`SELECT id FROM public.users WHERE email = ${testEmail} LIMIT 1`;
     if (!user[0]) {
       const newUser = await sql`
@@ -524,7 +679,6 @@ app.post('/create-test-api-key', async (c) => {
       user = newUser;
     }
     
-    // Generate API key
     const apiKey = `mcp_${crypto.randomUUID().replace(/-/g, '')}`;
     const expiresAt = new Date();
     expiresAt.setFullYear(expiresAt.getFullYear() + 1); // 1 year expiry
@@ -549,7 +703,6 @@ app.post('/create-test-api-key', async (c) => {
   }
 });
 
-// Store the auto-created API key globally to reuse it
 let globalMCPApiKey: string | null = null;
 
 app.post('/mcp-server', async (c) => {
@@ -560,26 +713,22 @@ app.post('/mcp-server', async (c) => {
 
   let apiKey = c.req.header('x-api-key');
   
-  // Also check for API key in query parameters
   if (!apiKey) {
     const url = new URL(c.req.url);
-    apiKey = url.searchParams.get('api_key') || url.searchParams.get('apikey');
+    apiKey = url.searchParams.get('api_key') || url.searchParams.get('apikey') || undefined;
   }
   
   if (!apiKey) {
-    // If no API key provided, reuse existing one or create one
     if (globalMCPApiKey) {
       apiKey = globalMCPApiKey;
       console.log('[MCP] Reusing existing API key:', apiKey.substring(0, 8) + '...');
     } else {
       console.log('[MCP] No API key provided, creating one automatically');
       
-      // Create a test user first
       const testEmail = 'mcp-auto@example.com';
       const testPassword = 'mcp123';
       const passwordHash = Buffer.from(testPassword).toString('base64');
       
-      // Check if test user exists, if not create one
       let user = await sql`SELECT id FROM public.users WHERE email = ${testEmail} LIMIT 1`;
       if (!user[0]) {
         const newUser = await sql`
@@ -590,7 +739,6 @@ app.post('/mcp-server', async (c) => {
         user = newUser;
       }
       
-      // Generate API key
       const newApiKey = `mcp_${crypto.randomUUID().replace(/-/g, '')}`;
       const expiresAt = new Date();
       expiresAt.setFullYear(expiresAt.getFullYear() + 1);
@@ -602,8 +750,10 @@ app.post('/mcp-server', async (c) => {
       `;
       
       apiKey = keyData[0].key;
-      globalMCPApiKey = apiKey; // Store for reuse
-      console.log('[MCP] Created new API key:', apiKey.substring(0, 8) + '...');
+      globalMCPApiKey = apiKey || null; // Store for reuse
+      if (apiKey) {
+        console.log('[MCP] Created new API key:', apiKey.substring(0, 8) + '...');
+      }
     }
     
     console.log(`[MCP] Connection established with client: ${clientInfo}`);
@@ -714,8 +864,8 @@ app.post('/mcp-server', async (c) => {
                 expiresAt.setFullYear(expiresAt.getFullYear() + 1);
                 
                 const keyData = await sql`
-                  INSERT INTO public.api_keys (key, user_id, name, expires_at, rate_limit, scopes)
-                  VALUES (${newApiKey}, ${user[0].id}, 'MCP Auto Key', ${expiresAt.toISOString()}, 1000, ARRAY['read','write'])
+                  INSERT INTO public.api_keys (key, user_id, name, is_active, expires_at, rate_limit, scopes)
+                  VALUES (${newApiKey}, ${user[0].id}, 'MCP Auto Key', true, ${expiresAt.toISOString()}, 1000, ARRAY['read','write'])
                   RETURNING id, is_active, user_id
                 `;
                 
@@ -877,6 +1027,9 @@ app.post('/mcp-server', async (c) => {
       case 'resources/read': {
         const uri = params?.uri as string;
         const limit = uri === 'memory://recent' ? 50 : 1000;
+        if (!apiKey) {
+          return json(null, { code: -32000, message: 'API key required' });
+        }
         const resp = await fetch(`${apiBase}/list-memories?limit=${limit}`, { headers: { 'X-API-Key': apiKey } });
         const data = await resp.json();
         if (!resp.ok) return json(null, { code: -32000, message: data.error || 'Failed to read resource' });
@@ -949,6 +1102,580 @@ app.post('/auth/logout', async (c) => {
   return c.json({ success: true });
 });
 
-export default app;
+// Helper function to convert PostgreSQL UUID to MongoDB ObjectId string
+function getMongoUserId(postgresUserId: string): string {
+  // Use PostgreSQL user ID as MongoDB user ID (store as string)
+  // For compatibility, we'll use a fixed prefix + the UUID
+  return `user_${postgresUserId}`;
+}
 
+
+
+// Chat API - Send message to a conversation
+app.post('/api/chat', async (c) => {
+  try {
+    const body = await c.req.json();
+    const { 
+      messages, 
+      model: requestedModel, 
+      provider: requestedProvider,
+      apiKey: frontendApiKey,
+      conversationId,
+      useMemories = true,
+      dashboardApiKey
+    } = body;
+
+    console.log('[Chat] Request received:', { 
+      model: requestedModel || requestedProvider, 
+      conversationId,
+      messageCount: messages?.length 
+    });
+
+    // Get user from session
+    const session = await getUserFromSession(c);
+    const userId = session?.user_id;
+
+    if (!messages || !Array.isArray(messages)) {
+      return c.json({ error: 'Messages array is required' }, 400);
+    }
+
+    // Use provider or model (frontend may send either)
+    const model = requestedModel || requestedProvider || 'gemini-1.5';
+
+    // Filter out messages with empty content
+    const validMessages = messages.filter((m: any) => 
+      m.content && typeof m.content === 'string' && m.content.trim() !== ''
+    );
+
+    if (validMessages.length === 0) {
+      return c.json({ error: 'No valid messages found' }, 400);
+    }
+
+    // Get the last user message
+    const lastUserMessage = validMessages.filter((m: any) => m.role === 'user').pop();
+    if (!lastUserMessage) {
+      return c.json({ error: 'No user message found' }, 400);
+    }
+
+    // Search for relevant memories
+    let relevantContext = '';
+    let memoryCount = 0;
+    let memorySources: string[] = [];
+
+    if (useMemories && userId) {
+      try {
+        const memories = await getRelevantMemories(userId, lastUserMessage.content, dashboardApiKey, 10);
+        if (memories && memories.length > 0) {
+          memoryCount = memories.length;
+          memorySources = [...new Set(memories.map((m: any) => m.source as string | undefined).filter((source): source is string => source !== undefined))];
+          relevantContext = memories
+            .map((mem, idx) => `[Memory ${idx + 1} from ${mem.source}]:\n${mem.content}`)
+            .join('\n\n');
+          console.log(`[Chat] Found ${memoryCount} relevant memories`);
+        }
+      } catch (error: any) {
+        console.warn('[Chat] Memory retrieval error:', error.message);
+      }
+    }
+
+    // Load file context system messages
+    let fileContextBlock = '';
+    if (conversationId) {
+      try {
+        await connectDB();
+        const conv = await Conversation.findOne({ _id: conversationId, userId });
+        if (conv) {
+          const fileMessages = conv.messages
+            .filter((m: any) => m.role === 'system' && m.content.startsWith('[[FILE:'))
+            .map((m: any) => m.content);
+          if (fileMessages.length > 0) {
+            fileContextBlock = fileMessages.join('\n\n');
+            console.log('[Chat] Using file system messages count:', fileMessages.length);
+          }
+        }
+      } catch (e: any) {
+        console.warn('[Chat] File context load failed:', e.message);
+      }
+    }
+
+    // Build system prompt
+    let systemPrompt = 'You are a helpful AI assistant.';
+    const parts: string[] = [];
+    if (fileContextBlock) {
+      parts.push(`===== FILE CONTEXT =====\n${fileContextBlock}\n===== END FILE CONTEXT =====`);
+    }
+    if (relevantContext) {
+      parts.push(`===== MEMORY CONTEXT =====\n${relevantContext}\n===== END MEMORY CONTEXT =====`);
+    }
+    if (parts.length > 0) {
+      systemPrompt = `You are a helpful AI assistant. Use the provided context intelligently only when relevant.\n\n${parts.join('\n\n')}`;
+    }
+
+    // Prepare messages for AI using the Message type from ai-models
+    const aiMessages: Message[] = [
+      { role: 'system', content: systemPrompt },
+      ...validMessages.map((m: any) => ({ 
+        role: m.role as 'user' | 'assistant' | 'system', 
+        content: m.content 
+      }))
+    ];
+
+    // Get API key
+    let apiKey = frontendApiKey || '';
+    if (!apiKey) {
+      if (model.startsWith('gemini')) apiKey = process.env.GEMINI_API_KEY || '';
+      else if (model.startsWith('gpt-')) apiKey = process.env.OPENAI_API_KEY || '';
+      else if (model === 'claude') apiKey = process.env.ANTHROPIC_API_KEY || '';
+      else if (model === 'perplexity') apiKey = process.env.PERPLEXITY_API_KEY || '';
+      else apiKey = process.env.GEMINI_API_KEY || ''; // default
+    }
+
+    if (!apiKey) {
+      return c.json({ error: `API key not configured for model: ${model}` }, 500);
+    }
+
+    // Prepare the ChatRequest
+    const chatRequest: ChatRequest = {
+      messages: aiMessages,
+      apiKey,
+      temperature: 0.7,
+      maxTokens: 2048,
+    };
+
+    // Call the existing working chatWithAI function
+    console.log('[Chat] Calling AI model:', model);
+    const aiResponse: ChatResponse = await chatWithAI(model as AIProvider, chatRequest);
+
+    console.log('[Chat] AI Response received:', { 
+      contentLength: aiResponse.content?.length,
+      model: aiResponse.model 
+    });
+
+    if (!aiResponse.content || aiResponse.content.trim() === '') {
+      throw new Error('AI returned empty response');
+    }
+
+    // Save to MongoDB if user is authenticated
+    let savedConversationId = conversationId;
+    if (userId) {
+      try {
+        await connectDB();
+        
+        if (conversationId) {
+          // Update existing conversation
+          await Conversation.findOneAndUpdate(
+            { _id: conversationId, userId },
+            {
+              $push: {
+                messages: {
+                  $each: [
+                    { role: 'user', content: lastUserMessage.content, timestamp: new Date() },
+                    { role: 'assistant', content: aiResponse.content, timestamp: new Date(), model }
+                  ]
+                }
+              },
+              $set: { currentModel: model, updatedAt: new Date() }
+            }
+          );
+        } else {
+          // Create new conversation
+          const newConversation = await Conversation.create({
+            userId,
+            title: lastUserMessage.content.substring(0, 50) + (lastUserMessage.content.length > 50 ? '...' : ''),
+            messages: [
+              { role: 'user', content: lastUserMessage.content, timestamp: new Date() },
+              { role: 'assistant', content: aiResponse.content, timestamp: new Date(), model }
+            ],
+            currentModel: model,
+          });
+          savedConversationId = newConversation._id.toString();
+        }
+        console.log('[Chat] Conversation saved to MongoDB');
+      } catch (dbError: any) {
+        console.warn('[Chat] Failed to save conversation:', dbError.message);
+      }
+    }
+
+    // Store in chat memory (non-blocking)
+    if (userId) {
+      try {
+        await storeChatMemory(userId, `User: ${lastUserMessage.content}`, 'chat');
+        await storeChatMemory(userId, `Assistant: ${aiResponse.content}`, 'chat');
+      } catch (e) {
+        console.warn('[Chat] Failed to store in chat memory');
+      }
+    }
+
+    console.log('[Chat] Response generated successfully');
+
+    // Add detailed logging before returning
+    console.log('[Chat] Returning response:', {
+      hasContent: !!aiResponse.content,
+      contentPreview: aiResponse.content?.substring(0, 100),
+      model: aiResponse.model,
+      conversationId: savedConversationId,
+      memoryCount,
+    });
+
+    return c.json({
+      content: aiResponse.content,
+      model: aiResponse.model,
+      timestamp: aiResponse.timestamp,
+      conversationId: savedConversationId,
+      memoryCount,
+      memoriesUsed: memoryCount > 0,
+      memorySources,
+      tokensUsed: aiResponse.tokensUsed,
+    });
+
+  } catch (error: any) {
+    console.error('❌ Chat API error:', error);
+    return c.json({ 
+      error: error.message || 'Failed to process chat request'
+    }, 500);
+  }
+});
+
+// Get chat sessions (conversation history list)
+app.get('/api/chat/sessions', async (c) => {
+  try {
+    const session = await getUserFromSession(c);
+    if (!session) {
+      return c.json({ error: 'Authentication required' }, 401);
+    }
+
+    const userId = session.user_id;
+
+    await connectDB();
+    const conversations = await Conversation.find({ userId })
+      .sort({ updatedAt: -1 })
+      .limit(50)
+      .select('_id title messages createdAt updatedAt currentModel');
+
+    const sessions = conversations.map(conv => ({
+      id: conv._id.toString(),
+      title: conv.title || (conv.messages[0]?.content?.substring(0, 50) || 'New Chat'),
+      preview: conv.messages[conv.messages.length - 1]?.content?.substring(0, 100) || '',
+      messageCount: conv.messages.length,
+      model: conv.currentModel,
+      createdAt: conv.createdAt,
+      updatedAt: conv.updatedAt,
+    }));
+
+    return c.json({ success: true, sessions });
+  } catch (error: any) {
+    console.error('❌ Get chat sessions error:', error);
+    return c.json({ error: error.message || 'Failed to get chat sessions' }, 500);
+  }
+});
+
+// Get specific chat session
+app.get('/api/chat/sessions/:id', async (c) => {
+  try {
+    const session = await getUserFromSession(c);
+    if (!session) {
+      return c.json({ error: 'Authentication required' }, 401);
+    }
+
+    const userId = session.user_id;
+    const conversationId = c.req.param('id');
+
+    await connectDB();
+    const conversation = await Conversation.findOne({ 
+      _id: conversationId, 
+      userId 
+    });
+
+    if (!conversation) {
+      return c.json({ error: 'Conversation not found' }, 404);
+    }
+
+    return c.json({
+      success: true,
+      conversation: {
+        id: conversation._id.toString(),
+        title: conversation.title,
+        messages: conversation.messages,
+        model: conversation.currentModel,
+        createdAt: conversation.createdAt,
+        updatedAt: conversation.updatedAt,
+      }
+    });
+  } catch (error: any) {
+    console.error('❌ Get chat session error:', error);
+    return c.json({ error: error.message || 'Failed to get chat session' }, 500);
+  }
+});
+
+// Create new chat session
+app.post('/api/chat/sessions', async (c) => {
+  try {
+    const session = await getUserFromSession(c);
+    if (!session) {
+      return c.json({ error: 'Authentication required' }, 401);
+    }
+
+    const userId = session.user_id;
+    const { title, model } = await c.req.json();
+
+    await connectDB();
+    const conversation = await Conversation.create({
+      userId,
+      title: title || 'New Chat',
+      messages: [],
+      currentModel: model || 'gemini-1.5',
+    });
+
+    return c.json({
+      success: true,
+      conversation: {
+        id: conversation._id.toString(),
+        title: conversation.title,
+        messages: conversation.messages,
+        model: conversation.currentModel,
+        createdAt: conversation.createdAt,
+      }
+    });
+  } catch (error: any) {
+    console.error('❌ Create chat session error:', error);
+    return c.json({ error: error.message || 'Failed to create chat session' }, 500);
+  }
+});
+
+// Rename chat session
+app.patch('/api/chat/sessions/:id', async (c) => {
+  try {
+    const session = await getUserFromSession(c);
+    if (!session) {
+      return c.json({ error: 'Authentication required' }, 401);
+    }
+
+    const userId = session.user_id;
+    const conversationId = c.req.param('id');
+    const { title } = await c.req.json();
+
+    await connectDB();
+    const conversation = await Conversation.findOneAndUpdate(
+      { _id: conversationId, userId },
+      { $set: { title } },
+      { new: true }
+    );
+
+    if (!conversation) {
+      return c.json({ error: 'Conversation not found' }, 404);
+    }
+
+    return c.json({ success: true, title: conversation.title });
+  } catch (error: any) {
+    console.error('❌ Rename chat session error:', error);
+    return c.json({ error: error.message || 'Failed to rename' }, 500);
+  }
+});
+
+// Delete chat session
+app.delete('/api/chat/sessions/:id', async (c) => {
+  try {
+    const session = await getUserFromSession(c);
+    if (!session) {
+      return c.json({ error: 'Authentication required' }, 401);
+    }
+
+    const userId = session.user_id;
+    const conversationId = c.req.param('id');
+
+    await connectDB();
+    const result = await Conversation.deleteOne({ 
+      _id: conversationId, 
+      userId 
+    });
+
+    if (result.deletedCount === 0) {
+      return c.json({ error: 'Conversation not found' }, 404);
+    }
+
+    return c.json({ success: true, message: 'Conversation deleted' });
+  } catch (error: any) {
+    console.error('❌ Delete chat session error:', error);
+    return c.json({ error: error.message || 'Failed to delete' }, 500);
+  }
+});
+
+// Document endpoints
+app.post('/api/documents/upload', async (c) => {
+  try {
+    const session = await getUserFromSession(c);
+    if (!session) {
+      return c.json({ error: 'Authentication required' }, 401);
+    }
+    
+    const formData = await c.req.formData();
+    const file = formData.get('file') as File;
+    
+    if (!file) {
+      return c.json({ error: 'File is required' }, 400);
+    }
+    
+    const fileBuffer = Buffer.from(await file.arrayBuffer());
+    const result = await storeDocument(
+      session.user_id,
+      file.name,
+      file.name,
+      file.type,
+      file.size,
+      fileBuffer
+    );
+    
+    return c.json({ success: true, document: result });
+  } catch (error: any) {
+    console.error('❌ Document upload error:', error);
+    return c.json({ error: error.message || 'Failed to upload document' }, 500);
+  }
+});
+
+app.get('/api/documents', async (c) => {
+  try {
+    const session = await getUserFromSession(c);
+    if (!session) {
+      return c.json({ error: 'Authentication required' }, 401);
+    }
+    
+    const documents = await listDocuments(session.user_id);
+    return c.json({ success: true, documents });
+  } catch (error: any) {
+    console.error('❌ List documents error:', error);
+    return c.json({ error: error.message || 'Failed to list documents' }, 500);
+  }
+});
+
+app.get('/api/documents/:id', async (c) => {
+  try {
+    const session = await getUserFromSession(c);
+    if (!session) {
+      return c.json({ error: 'Authentication required' }, 401);
+    }
+    
+    const documentId = c.req.param('id');
+    const document = await getDocument(session.user_id, documentId);
+    
+    if (!document) {
+      return c.json({ error: 'Document not found' }, 404);
+    }
+    
+    return c.json({ success: true, document });
+  } catch (error: any) {
+    console.error('❌ Get document error:', error);
+    return c.json({ error: error.message || 'Failed to get document' }, 500);
+  }
+});
+
+app.delete('/api/documents/:id', async (c) => {
+  try {
+    const session = await getUserFromSession(c);
+    if (!session) {
+      return c.json({ error: 'Authentication required' }, 401);
+    }
+    
+    const documentId = c.req.param('id');
+    await deleteDocument(session.user_id, documentId);
+    
+    return c.json({ success: true, message: 'Document deleted' });
+  } catch (error: any) {
+    console.error('❌ Delete document error:', error);
+    return c.json({ error: error.message || 'Failed to delete document' }, 500);
+  }
+});
+
+app.post('/api/documents/search', async (c) => {
+  try {
+    const session = await getUserFromSession(c);
+    if (!session) {
+      return c.json({ error: 'Authentication required' }, 401);
+    }
+    
+    const { documentId, query, topK = 5 } = await c.req.json();
+    
+    if (!documentId || !query) {
+      return c.json({ error: 'documentId and query are required' }, 400);
+    }
+    
+    const chunks = await searchDocumentChunks(session.user_id, documentId, query, topK);
+    
+    return c.json({ success: true, chunks });
+  } catch (error: any) {
+    console.error('❌ Search document error:', error);
+    return c.json({ error: error.message || 'Failed to search document' }, 500);
+  }
+});
+
+// Health check
+app.get('/health', (c) => {
+  return c.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Replace the /api/chat/file-context handler:
+
+app.post('/api/chat/file-context', async (c) => {
+  try {
+    const session = await getUserFromSession(c);
+    if (!session) return c.json({ error: 'Authentication required' }, 401);
+
+    const form = await c.req.formData();
+    const file = form.get('file') as File;
+    const conversationId = form.get('conversationId') as string | null;
+
+    if (!file) return c.json({ error: 'File is required' }, 400);
+
+    const allowed = ['pdf','txt','docx','md','csv'];
+    const ext = file.name.toLowerCase().split('.').pop() || '';
+    if (!allowed.includes(ext)) {
+      return c.json({ error: `Unsupported file type: ${ext}` }, 400);
+    }
+
+    const arrayBuffer = await file.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    const rawText = await extractFileText(buffer, file.name, file.type);
+    const cleaned = rawText.replace(/\r/g,'').trim().slice(0, 20000);
+    if (!cleaned) return c.json({ error: 'Failed to extract text' }, 400);
+
+    await connectDB();
+
+    let conv = null;
+    if (conversationId) {
+      conv = await Conversation.findOne({ _id: conversationId, userId: session.user_id });
+    }
+    if (!conv) {
+      conv = await Conversation.create({
+        userId: session.user_id,
+        title: file.name,
+        messages: [],
+        currentModel: 'gemini-1.5'
+      });
+    }
+
+    // Store file preview as a system message (ChatGPT‑style context)
+    conv.messages.push({
+      role: 'system',
+      content: `[[FILE: ${file.name} / ${file.type} / ${file.size} bytes]]\n${cleaned.slice(0, 1500)}`
+    });
+    if (!conv.title) conv.title = file.name;
+    conv.updatedAt = new Date();
+    await conv.save();
+
+    return c.json({
+      success: true,
+      conversationId: conv._id.toString(),
+      file: {
+        name: file.name,
+        size: file.size,
+        type: file.type,
+        previewStored: cleaned.length >= 1
+      }
+    });
+  } catch (e: any) {
+    console.error('❌ File context error:', e);
+    return c.json({ error: e.message || 'Failed to attach file' }, 500);
+  }
+});
+
+export default app;
 
